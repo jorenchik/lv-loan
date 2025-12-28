@@ -4,6 +4,7 @@ import re
 import pandas as pd
 import sys
 import os
+from collections import defaultdict
 from tqdm import tqdm
 
 from data_prep.corpus.cqp import (
@@ -18,7 +19,65 @@ from data_prep.wordnet.wordnet import WordNet
 from data_prep.translate.translate import translate_lv_to_en_batch, load_model
 
 
-def get_best_sentence(word, corpus, cqp_bin, cqp_dir):
+def get_tagged_lemmas(parsed_result, lemma_set_lower, primary_lemma):
+  """Return dict mapping tag_num -> lemma for all loanwords in sentence."""
+  if parsed_result is None:
+    return {1: primary_lemma}
+
+  loanword_positions = []
+  for i, token in enumerate(parsed_result.tokens):
+    token_lemma = token.lemma.lower()
+    if token_lemma in lemma_set_lower:
+      orig_lemma = lemma_set_lower[token_lemma]
+      is_primary = (token_lemma == primary_lemma.lower())
+      loanword_positions.append((i, orig_lemma, is_primary))
+
+  if not loanword_positions:
+    return {1: primary_lemma}
+
+  loanword_positions.sort(key=lambda x: (not x[2], x[0]))
+  return {
+    tag_num: lemma
+    for tag_num, (_, lemma, _) in enumerate(loanword_positions, start=1)
+  }
+
+
+def tag_all_loanwords(parsed_result, lemma_set_lower, primary_lemma):
+  """Tag all loanwords in sentence with L1, L2, L3..."""
+  if parsed_result is None:
+    return None
+
+  loanword_positions = []
+  for i, token in enumerate(parsed_result.tokens):
+    token_lemma = token.lemma.lower()
+    if token_lemma in lemma_set_lower:
+      is_primary = (token_lemma == primary_lemma.lower())
+      loanword_positions.append((i, token.word, is_primary))
+
+  if not loanword_positions:
+    return None
+
+  loanword_positions.sort(key=lambda x: (not x[2], x[0]))
+
+  tag_map = {}
+  for tag_num, (pos, _, _) in enumerate(loanword_positions, start=1):
+    tag_map[pos] = tag_num
+
+  tokens = []
+  for i, t in enumerate(parsed_result.tokens):
+    if i in tag_map:
+      tag_num = tag_map[i]
+      tokens.append(f"<L{tag_num}>{t.word}</L{tag_num}>")
+    else:
+      tokens.append(t.word)
+
+  return " ".join(tokens)
+
+
+def get_best_sentence_per_lemma(
+  word, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score=True
+):
+  """Query single lemma, return best sentence and parsed result."""
   search_query = f'[lemma="{word}"]'
   raw_output = query_cqp(corpus, search_query, 50, cqp_bin, cqp_dir)
 
@@ -32,47 +91,227 @@ def get_best_sentence(word, corpus, cqp_bin, cqp_dir):
         results.append(parsed)
 
   if not results:
-    return None, word
+    return None, word, None
 
-  scored = sorted(
-    [(score_sentence(r), r) for r in results], key=lambda x: x[0], reverse=True
-  )
-  best_res = scored[0][1]
+  if do_score:
+    scored = sorted(
+      [(score_sentence(r), r) for r in results], key=lambda x: x[0], reverse=True
+    )
+    best_res = scored[0][1]
+  else:
+    best_res = results[0]
 
-  tokens = []
-  matched_form = word
-  for i, t in enumerate(best_res.tokens):
-    if i == best_res.match_index:
-      matched_form = t.word
-      tokens.append(f"<L1>{t.word}</L1>")
+  sentence = tag_all_loanwords(best_res, lemma_set_lower, word)
+  return sentence, word, best_res
+
+
+def get_sentences_single_query(
+  lemmas, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score=True
+):
+  """Query all lemmas at once, return dict mapping lemma -> (sentence, matched_form, parsed)."""
+  escaped_lemmas = [re.escape(lemma) for lemma in lemmas]
+  pattern = "|".join(escaped_lemmas)
+  search_query = f'[lemma="{pattern}"]'
+
+  raw_output = query_cqp(corpus, search_query, 50 * len(lemmas), cqp_bin, cqp_dir)
+
+  results_by_lemma = defaultdict(list)
+  if raw_output:
+    for line in raw_output.split("\n"):
+      if not line.strip():
+        continue
+      parsed = parse_cqp_line(line)
+      if parsed:
+        matched_token = parsed.tokens[parsed.match_index]
+        matched_lemma = matched_token.lemma.lower()
+        results_by_lemma[matched_lemma].append(parsed)
+
+  output = {}
+  lemma_lower_to_orig = {lemma.lower(): lemma for lemma in lemmas}
+
+  for lemma_lower, lemma_orig in lemma_lower_to_orig.items():
+    results = results_by_lemma.get(lemma_lower, [])
+    if not results:
+      output[lemma_orig] = (None, lemma_orig, None)
+      continue
+
+    if do_score:
+      scored = sorted(
+        [(score_sentence(r), r) for r in results], key=lambda x: x[0], reverse=True
+      )
+      best_res = scored[0][1]
     else:
-      tokens.append(t.word)
-  return " ".join(tokens), matched_form
+      best_res = results[0]
+
+    sentence = tag_all_loanwords(best_res, lemma_set_lower, lemma_orig)
+    output[lemma_orig] = (sentence, lemma_orig, best_res)
+
+  return output
+
+
+def count_loanwords_in_sentence(parsed_result, lemma_set_lower):
+  """Count how many loanwords from the list appear in a parsed sentence."""
+  if parsed_result is None:
+    return set()
+
+  matched_lemmas = set()
+  for token in parsed_result.tokens:
+    token_lemma = token.lemma.lower()
+    if token_lemma in lemma_set_lower:
+      matched_lemmas.add(lemma_set_lower[token_lemma])
+
+  return matched_lemmas
+
+
+def count_tags_in_sentence(sentence):
+  """Count how many <L#> tags are in the sentence."""
+  if not sentence:
+    return 1
+  matches = re.findall(r"<L(\d+)>", sentence)
+  return len(matches) if matches else 1
 
 
 def strip_tags(sentence):
-  """Remove <L1></L1> tags for translation."""
+  """Remove <L1></L1> etc. tags for translation."""
   return re.sub(r"</?[LN]\d+>", "", sentence)
 
 
-def create_native_template(sentence_with_loan_tag):
-  """Replace <L1>word</L1> with <N1></N1> for annotator to fill."""
-  return re.sub(r"<L1>[^<]+</L1>", "<N1></N1>", sentence_with_loan_tag)
+def create_native_template(sentence_with_loan_tags):
+  """Replace <L1>word</L1>, <L2>word</L2>, etc. with <N1></N1>, <N2></N2>, etc."""
+  def replace_tag(match):
+    tag_num = match.group(1)
+    return f"<N{tag_num}></N{tag_num}>"
+
+  return re.sub(r"<L(\d+)>[^<]+</L\d+>", replace_tag, sentence_with_loan_tags)
 
 
-def format_synonyms(word, wn: WordNet):
+def format_word_synonyms(word, wn: WordNet):
+  """Format synonyms for a single word, grouped by sense."""
   result = wn.get_synonym_groups(word)
   if not result.found:
     return ""
 
-  synonyms = set()
+  lines = []
+  sense_num = 1
   for entry in result.entries:
     for sense in entry.senses:
-      if sense.synonyms:
-        synonyms.update(sense.synonyms)
+      syns = set(sense.synonyms) if sense.synonyms else set()
+      syns.discard(word)
+      if not syns:
+        continue
 
-  synonyms.discard(word)
-  return "; ".join(sorted(synonyms))
+      definition = getattr(sense, 'definition', '') or ''
+      syn_str = ", ".join(sorted(syns))
+
+      if definition:
+        lines.append(f"{sense_num}. [{definition}]: {syn_str}")
+      else:
+        lines.append(f"{sense_num}. {syn_str}")
+      sense_num += 1
+
+  return "\n".join(lines)
+
+
+def format_synonyms(tagged_lemmas, wn: WordNet):
+  """Format synonyms grouped by loanword tag and sense."""
+  if len(tagged_lemmas) == 1:
+    return format_word_synonyms(tagged_lemmas[1], wn)
+
+  lines = []
+  for tag_num in sorted(tagged_lemmas.keys()):
+    word = tagged_lemmas[tag_num]
+    word_syns = format_word_synonyms(word, wn)
+    if word_syns:
+      lines.append(f"L{tag_num}:")
+      for line in word_syns.split("\n"):
+        lines.append(f"  {line}")
+
+  return "\n".join(lines)
+
+
+def build_row(rec_word, sentence_loan, row, wn, parsed_result, lemma_set_lower):
+  """Build a single output row dict."""
+  if sentence_loan is None:
+    sentence_loan = f"<L1>{rec_word}</L1>"
+    found = False
+  else:
+    found = True
+
+  sentence_native = create_native_template(sentence_loan)
+  tagged_lemmas = get_tagged_lemmas(parsed_result, lemma_set_lower, rec_word)
+  synonyms = format_synonyms(tagged_lemmas, wn)
+
+  tag_count = count_tags_in_sentence(sentence_loan)
+
+  base_donor_lang = row.get("donor_language", "")
+  base_donor_word = row.get("donor_word", "")
+
+  if tag_count > 1:
+    donor_lang = f"1- {base_donor_lang}\n" + "\n".join(
+      f"{i}-" for i in range(2, tag_count + 1)
+    )
+    donor_word = f"1- {base_donor_word}\n" + "\n".join(
+      f"{i}-" for i in range(2, tag_count + 1)
+    )
+  else:
+    donor_lang = base_donor_lang
+    donor_word = base_donor_word
+
+  return {
+    "Loanword sentence": sentence_loan,
+    "Native sentence": sentence_native,
+    "Target": "",
+    "Valid.": False,
+    "Donor lang.": donor_lang,
+    "Donor word": donor_word,
+    "Suggestions": synonyms,
+    "Etymology": row.get("lang_info", "").strip(),
+  }, found
+
+
+def print_results_summary(stats):
+  """Print detailed results summary."""
+  total = stats["total"]
+  found = stats["found"]
+  not_found = stats["not_found"]
+
+  print("\n" + "=" * 60)
+  print("RESULTS SUMMARY")
+  print("=" * 60)
+  print(f"Total lemmas processed: {total}")
+  print(f"  Found in corpus:      {found} ({100*found/total:.1f}%)")
+  print(f"  Not found:            {not_found} ({100*not_found/total:.1f}%)")
+
+  if stats["by_donor"]:
+    print("\nBy donor language:")
+    print("-" * 40)
+    for lang in sorted(stats["by_donor"].keys()):
+      lang_stats = stats["by_donor"][lang]
+      lang_total = lang_stats["found"] + lang_stats["not_found"]
+      print(
+        f"  {lang or '(unknown)':<20} "
+        f"{lang_stats['found']:>4}/{lang_total:<4} "
+        f"({100*lang_stats['found']/lang_total:.1f}%)"
+      )
+
+  if stats["sentence_matches"]:
+    print("\nSentences by loanword count:")
+    print("-" * 40)
+    match_counts = defaultdict(int)
+
+    for sentence_text, matched_lemmas in stats["sentence_matches"].items():
+      count = len(matched_lemmas)
+      match_counts[count] += 1
+
+    for count in sorted(match_counts.keys(), reverse=True):
+      num_sentences = match_counts[count]
+      label = "loanword" if count == 1 else "loanwords"
+      print(f"  {count} {label}: {num_sentences} sentences")
+
+  if stats["not_found_lemmas"]:
+    print(f"\nNot found lemmas ({len(stats['not_found_lemmas'])})")
+
+  print("=" * 60 + "\n")
 
 
 def main():
@@ -91,6 +330,18 @@ def main():
   parser.add_argument(
     "--batch-size", type=int, default=32, help="Translation batch size"
   )
+  parser.add_argument(
+    "--translate", action="store_true", default=False,
+    help="Enable translation (default: False)"
+  )
+  parser.add_argument(
+    "--score", action="store_true", default=False,
+    help="Enable sentence scoring for best selection (default: False)"
+  )
+  parser.add_argument(
+    "--strategy", choices=["per_lemma", "single_query"], default="per_lemma",
+    help="Query strategy: per_lemma (one query per word) or single_query (all at once)"
+  )
   parser.add_argument("--corpus", default=DEFAULT_CORPUS)
   parser.add_argument("--cqp-bin", default=DEFAULT_CQP_BIN)
   parser.add_argument("--cqp-dir", default=DEFAULT_CQP_DIR)
@@ -103,8 +354,9 @@ def main():
   print("Initializing WordNet...")
   wn = WordNet(args.wordnet_xml)
 
-  print("Loading translation model...")
-  load_model()
+  if args.translate:
+    print("Loading translation model...")
+    load_model()
 
   input_rows = []
   for file_path in args.inputs:
@@ -118,53 +370,143 @@ def main():
     print("Error: No data found in provided input files.", file=sys.stderr)
     sys.exit(1)
 
-  rows_to_write = []
-  sentences_to_translate = []
+  all_lemmas = [
+    row.get("recepient_word", "").strip()
+    for row in input_rows
+    if row.get("recepient_word", "").strip()
+  ]
+  lemma_set_lower = {lemma.lower(): lemma for lemma in all_lemmas}
 
-  print(f"Processing {len(input_rows)} entries...")
-  for row in tqdm(input_rows, desc="Extracting", unit="word"):
-    rec_word = row.get("recepient_word", "").strip()
-    if not rec_word:
-      continue
+  found_rows = []
+  not_found_rows = []
+  found_sentences = []
+  not_found_sentences = []
 
-    sentence_loan, _ = get_best_sentence(
-      rec_word, args.corpus, args.cqp_bin, args.cqp_dir
+  stats = {
+    "total": 0,
+    "found": 0,
+    "not_found": 0,
+    "by_donor": defaultdict(lambda: {"found": 0, "not_found": 0}),
+    "not_found_lemmas": [],
+    "sentence_matches": {},
+  }
+
+  print(f"Processing {len(input_rows)} entries (strategy: {args.strategy})...")
+
+  if args.strategy == "single_query":
+    lemmas = [
+      row.get("recepient_word", "").strip()
+      for row in input_rows
+      if row.get("recepient_word", "").strip()
+    ]
+    print(f"Querying {len(lemmas)} lemmas in single query...")
+    sentence_map = get_sentences_single_query(
+      lemmas,
+      args.corpus,
+      args.cqp_bin,
+      args.cqp_dir,
+      lemma_set_lower,
+      do_score=args.score,
     )
 
-    if sentence_loan is None:
-      sentence_loan = f"<L1>{rec_word}</L1>"
+    for row in tqdm(input_rows, desc="Building rows", unit="word"):
+      rec_word = row.get("recepient_word", "").strip()
+      if not rec_word:
+        continue
 
-    sentence_native = create_native_template(sentence_loan)
-    synonyms = format_synonyms(rec_word, wn)
+      sentence_loan, _, parsed_result = sentence_map.get(
+        rec_word, (None, rec_word, None)
+      )
+      output_row, found = build_row(
+        rec_word, sentence_loan, row, wn, parsed_result, lemma_set_lower
+      )
+      sentence_text = strip_tags(output_row["Loanword sentence"])
 
-    rows_to_write.append(
-      {
-        "Loanword sentence": sentence_loan,
-        "Native sentence": sentence_native,
-        "Target": "",
-        "Valid.": False,
-        "Donor lang.": row.get("donor_language", ""),
-        "Donor word": row.get("donor_word", ""),
-        "Suggestions": synonyms,
-        "Etymology": row.get("lang_info", "").strip(),
-      }
-    )
-    sentences_to_translate.append(strip_tags(sentence_loan))
+      stats["total"] += 1
+      donor_lang = row.get("donor_language", "")
+
+      if found:
+        stats["found"] += 1
+        stats["by_donor"][donor_lang]["found"] += 1
+        found_rows.append(output_row)
+        found_sentences.append(sentence_text)
+
+        matched_in_sentence = count_loanwords_in_sentence(
+          parsed_result, lemma_set_lower
+        )
+        if sentence_text not in stats["sentence_matches"]:
+          stats["sentence_matches"][sentence_text] = matched_in_sentence
+        else:
+          stats["sentence_matches"][sentence_text].update(matched_in_sentence)
+      else:
+        stats["not_found"] += 1
+        stats["by_donor"][donor_lang]["not_found"] += 1
+        stats["not_found_lemmas"].append(rec_word)
+        not_found_rows.append(output_row)
+        not_found_sentences.append(sentence_text)
+
+  else:
+    for row in tqdm(input_rows, desc="Extracting", unit="word"):
+      rec_word = row.get("recepient_word", "").strip()
+      if not rec_word:
+        continue
+
+      sentence_loan, _, parsed_result = get_best_sentence_per_lemma(
+        rec_word,
+        args.corpus,
+        args.cqp_bin,
+        args.cqp_dir,
+        lemma_set_lower,
+        do_score=args.score,
+      )
+      output_row, found = build_row(
+        rec_word, sentence_loan, row, wn, parsed_result, lemma_set_lower
+      )
+      sentence_text = strip_tags(output_row["Loanword sentence"])
+
+      stats["total"] += 1
+      donor_lang = row.get("donor_language", "")
+
+      if found:
+        stats["found"] += 1
+        stats["by_donor"][donor_lang]["found"] += 1
+        found_rows.append(output_row)
+        found_sentences.append(sentence_text)
+
+        matched_in_sentence = count_loanwords_in_sentence(
+          parsed_result, lemma_set_lower
+        )
+        if sentence_text not in stats["sentence_matches"]:
+          stats["sentence_matches"][sentence_text] = matched_in_sentence
+        else:
+          stats["sentence_matches"][sentence_text].update(matched_in_sentence)
+      else:
+        stats["not_found"] += 1
+        stats["by_donor"][donor_lang]["not_found"] += 1
+        stats["not_found_lemmas"].append(rec_word)
+        not_found_rows.append(output_row)
+        not_found_sentences.append(sentence_text)
+
+  rows_to_write = found_rows + not_found_rows
+  sentences_to_translate = found_sentences + not_found_sentences
+
+  print_results_summary(stats)
 
   column_widths_cm = [6.4, 6.4, 6.4, 1.8, 3.0, 3.0, 6.4, 10.0]
 
-  print(f"Translating {len(sentences_to_translate)} sentences...")
-  translations = []
-  for i in tqdm(
-    range(0, len(sentences_to_translate), args.batch_size),
-    desc="Translating",
-    unit="batch",
-  ):
-    batch = sentences_to_translate[i : i + args.batch_size]
-    translations.extend(translate_lv_to_en_batch(batch))
+  if args.translate:
+    print(f"Translating {len(sentences_to_translate)} sentences...")
+    translations = []
+    for i in tqdm(
+      range(0, len(sentences_to_translate), args.batch_size),
+      desc="Translating",
+      unit="batch",
+    ):
+      batch = sentences_to_translate[i : i + args.batch_size]
+      translations.extend(translate_lv_to_en_batch(batch))
 
-  for row, translation in zip(rows_to_write, translations):
-    row["Target"] = translation
+    for row, translation in zip(rows_to_write, translations):
+      row["Target"] = translation
 
   df = pd.DataFrame(rows_to_write)
 
@@ -186,7 +528,8 @@ def main():
 
   writer.close()
   print(f"ConLoan annotation file generated: {args.output}")
-  print(f"  - {len(rows_to_write)} loanword instances")
+  print(f"  - {len(found_rows)} matched lemmas")
+  print(f"  - {len(not_found_rows)} not found (placeholders appended)")
 
 
 if __name__ == "__main__":
