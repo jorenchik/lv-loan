@@ -48,7 +48,7 @@ def format_template(template):
   t_type = template[0].lower()
   
   # Skip non-relevant templates
-  if t_type in {"rfe", "suffix", "af", "inh", "cat", "考证", "zh-pron", "w"}:
+  if t_type in {"rfe", "suffix", "af", "inh", "cat", "考证", "zh-pron", "w", "cog"}:
     return None
   
   readable_prefix = TEMPLATE_READABLE.get(t_type)
@@ -97,9 +97,16 @@ def read_csv(csv_in, csv_out):
       if word and word[0].isupper():
         counter.update(["skipped_uppercase"])
         continue
+
+      if word and len(word) <= 2:
+        counter.update(["skipped_too_short"])
+        continue
+
+      if word and (word[0] == '-' or word[-1] == '-'):
+        counter.update(["skipped_prefix_suffix"])
+        continue
       
       templates = extract_templates(etymology)
-      
       if not templates:
         counter.update(["skipped_no_templates"])
         continue

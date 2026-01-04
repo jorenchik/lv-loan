@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 DEFAULT_CQP_BIN = "cqp" 
-DEFAULT_CQP_DIR = "/home/jorenchik/cwb"
-DEFAULT_CORPUS = "EMUARI"
+DEFAULT_CQP_DIR = "/home/jorenchik/code/lv-loan/cwb"
+DEFAULT_CORPUS = "LVK2022"
 DEFAULT_RESULTS = 200
 
 @dataclass
@@ -36,44 +36,52 @@ class CQPResult:
         return None
 
 def parse_cqp_line(line: str) -> Optional[CQPResult]:
-    """
-    Parses a single line of standard CQP ASCII output.
-    """
     try:
         id_part, content_part = line.split(':', 1)
         cqp_id = int(id_part.strip())
     except ValueError:
-        return None 
+        return None
 
     raw_tokens = content_part.strip().split()
     parsed_tokens = []
     match_index = -1
-    
-    for i, rt in enumerate(raw_tokens):
+    current_index = 0
 
-        if rt.startswith('<'):
+    for rt in raw_tokens:
+        # Skip obvious SGML fragments before parsing
+        if rt in ('<g', '<s>', '</s>') or rt.startswith('</'):
+            continue
+
+        is_match_start = rt.startswith('<')
+        if is_match_start:
             rt = rt[1:]
-            if match_index == -1: 
-              match_index = i
-        
+            if match_index == -1:
+                match_index = current_index
+
         if rt.endswith('>'):
             rt = rt[:-1]
-            
+
+        if not rt:
+            continue
+
         parts = rt.rsplit('/', 2)
-        
+
         if len(parts) == 3:
             w, p, lemma = parts
         elif len(parts) == 2:
             w, p = parts
-            lemma = w 
+            lemma = w
         else:
             w = rt
             p = "UNK"
             lemma = w
 
-        parsed_tokens.append(
-          Token(word=w, pos=p, lemma=lemma)
-        )
+        # Skip SGML-like words after parsing
+        if w in ('/>', '<g/>', '<g', '') or w.startswith('</'):
+            continue
+
+        parsed_tokens.append(Token(word=w, pos=p, lemma=lemma))
+        current_index += 1
 
     return CQPResult(
         cqp_id=cqp_id,
@@ -83,7 +91,7 @@ def parse_cqp_line(line: str) -> Optional[CQPResult]:
 
 def query_cqp(corpus, query, limit, cqp_bin, cqp_dir):
     registry = f"{cqp_dir}/registry"
-    
+
     commands = [
         f"{corpus};",
         "set Context 1 s;",
@@ -92,9 +100,12 @@ def query_cqp(corpus, query, limit, cqp_bin, cqp_dir):
         "show +pos +lemma;",
         "set PrintOptions noheader;",
         f"Results = {query};",
-        f"reduce Results to {limit};",
-        "cat Results;"
     ]
+
+    if limit is not None and limit > 0:
+        commands.append(f"reduce Results to {limit};")
+
+    commands.append("cat Results;")
 
     with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
         tf.write("\n".join(commands))
@@ -106,7 +117,7 @@ def query_cqp(corpus, query, limit, cqp_bin, cqp_dir):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=cqp_dir, 
+            cwd=cqp_dir,
         )
         stdout, _ = process.communicate()
         return stdout

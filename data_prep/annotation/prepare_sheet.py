@@ -94,57 +94,83 @@ def get_best_sentence_per_lemma(
     return None, word, None
 
   if do_score:
-    scored = sorted(
-      [(score_sentence(r), r) for r in results], key=lambda x: x[0], reverse=True
-    )
-    best_res = scored[0][1]
+    best = max(results, key=score_sentence)
   else:
-    best_res = results[0]
+    best = results[0]
 
-  sentence = tag_all_loanwords(best_res, lemma_set_lower, word)
-  return sentence, word, best_res
+  sentence = tag_all_loanwords(best, lemma_set_lower, word)
+  return sentence, word, best
 
 
-def get_sentences_single_query(
-  lemmas, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score=True
+def get_sentences_with_fallback(
+  lemmas, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score=True, limit=100000
 ):
-  """Query all lemmas at once, return dict mapping lemma -> (sentence, matched_form, parsed)."""
-  escaped_lemmas = [re.escape(lemma) for lemma in lemmas]
-  pattern = "|".join(escaped_lemmas)
+  """
+  Query all lemmas at once with limit, then fallback for missing ones.
+  """
+  escaped = [re.escape(lemma) for lemma in lemmas]
+  pattern = "|".join(escaped)
   search_query = f'[lemma="{pattern}"]'
 
-  raw_output = query_cqp(corpus, search_query, 50 * len(lemmas), cqp_bin, cqp_dir)
+  print(f"Querying {len(lemmas)} lemmas (limit: {limit})...")
+  raw_output = query_cqp(corpus, search_query, limit, cqp_bin, cqp_dir)
 
-  results_by_lemma = defaultdict(list)
+  # Track best per lemma
+  best_by_lemma = {}
+  lemma_lower_to_orig = {lemma.lower(): lemma for lemma in lemmas}
+  total_lines = 0
+
   if raw_output:
-    for line in raw_output.split("\n"):
+    lines = raw_output.split("\n")
+    for line in tqdm(lines, desc="Processing bulk results", unit="line"):
       if not line.strip():
         continue
+
+      total_lines += 1
       parsed = parse_cqp_line(line)
+      if not parsed or not parsed.target_word:
+        continue
+
+      lemma_lower = parsed.target_word.lemma.lower()
+      if lemma_lower not in lemma_lower_to_orig:
+        continue
+
+      score = score_sentence(parsed) if do_score else 0
+      if lemma_lower not in best_by_lemma or score > best_by_lemma[lemma_lower][0]:
+        best_by_lemma[lemma_lower] = (score, parsed)
+
+  found_count = len(best_by_lemma)
+  print(f"Bulk query: {total_lines} sentences, {found_count}/{len(lemmas)} lemmas found")
+
+  # Fallback for missing lemmas
+  missing = [
+    lemma_lower_to_orig[ll]
+    for ll in lemma_lower_to_orig
+    if ll not in best_by_lemma
+  ]
+
+  if missing:
+    print(f"Fallback: querying {len(missing)} missing lemmas individually...")
+    for lemma in tqdm(missing, desc="Fallback queries", unit="word"):
+      # if lemma in ["blaka", "svārki", "kāposti", "-nīca", "-isms", "-ists", "-itāte", "kraliņš", "kaninķenis", "gastūzis", "tallerķis", "-ācija", "-izēt", "riksmols", "indoeiropietis", "iekšan", "-īvs", "auzas", "ķerpers", "kreka"]:
+      #   breakpoint()
+      sentence, _, parsed = get_best_sentence_per_lemma(
+        lemma, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score
+      )
       if parsed:
-        matched_token = parsed.tokens[parsed.match_index]
-        matched_lemma = matched_token.lemma.lower()
-        results_by_lemma[matched_lemma].append(parsed)
+        score = score_sentence(parsed) if do_score else 0
+        best_by_lemma[lemma.lower()] = (score, parsed)
 
+  # Build output
   output = {}
-  lemma_lower_to_orig = {lemma.lower(): lemma for lemma in lemmas}
-
   for lemma_lower, lemma_orig in lemma_lower_to_orig.items():
-    results = results_by_lemma.get(lemma_lower, [])
-    if not results:
+    if lemma_lower not in best_by_lemma:
       output[lemma_orig] = (None, lemma_orig, None)
       continue
 
-    if do_score:
-      scored = sorted(
-        [(score_sentence(r), r) for r in results], key=lambda x: x[0], reverse=True
-      )
-      best_res = scored[0][1]
-    else:
-      best_res = results[0]
-
-    sentence = tag_all_loanwords(best_res, lemma_set_lower, lemma_orig)
-    output[lemma_orig] = (sentence, lemma_orig, best_res)
+    _, best = best_by_lemma[lemma_lower]
+    sentence = tag_all_loanwords(best, lemma_set_lower, lemma_orig)
+    output[lemma_orig] = (sentence, lemma_orig, best)
 
   return output
 
@@ -339,8 +365,12 @@ def main():
     help="Enable sentence scoring for best selection (default: False)"
   )
   parser.add_argument(
-    "--strategy", choices=["per_lemma", "single_query"], default="per_lemma",
-    help="Query strategy: per_lemma (one query per word) or single_query (all at once)"
+    "--strategy", choices=["per_lemma", "streaming"], default="streaming",
+    help="Query strategy: per_lemma (one query per word) or streaming (single unlimited query)"
+  )
+  parser.add_argument(
+    "--query-limit", type=int, default=100000,
+    help="Max results for bulk query before fallback (default: 100000)"
   )
   parser.add_argument("--corpus", default=DEFAULT_CORPUS)
   parser.add_argument("--cqp-bin", default=DEFAULT_CQP_BIN)
@@ -393,21 +423,23 @@ def main():
 
   print(f"Processing {len(input_rows)} entries (strategy: {args.strategy})...")
 
-  if args.strategy == "single_query":
+  if args.strategy == "streaming":
     lemmas = [
       row.get("recepient_word", "").strip()
       for row in input_rows
       if row.get("recepient_word", "").strip()
     ]
-    print(f"Querying {len(lemmas)} lemmas in single query...")
-    sentence_map = get_sentences_single_query(
+
+    sentence_map = get_sentences_with_fallback(
       lemmas,
       args.corpus,
       args.cqp_bin,
       args.cqp_dir,
       lemma_set_lower,
       do_score=args.score,
+      limit=args.query_limit,
     )
+    # ... rest unchanged
 
     for row in tqdm(input_rows, desc="Building rows", unit="word"):
       rec_word = row.get("recepient_word", "").strip()
@@ -445,7 +477,7 @@ def main():
         not_found_rows.append(output_row)
         not_found_sentences.append(sentence_text)
 
-  else:
+  else:  # per_lemma
     for row in tqdm(input_rows, desc="Extracting", unit="word"):
       rec_word = row.get("recepient_word", "").strip()
       if not rec_word:
