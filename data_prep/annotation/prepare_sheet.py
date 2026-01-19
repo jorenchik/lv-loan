@@ -4,6 +4,7 @@ import re
 import pandas as pd
 import sys
 import os
+import random
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -17,6 +18,7 @@ from data_prep.corpus.cqp import (
 )
 from data_prep.wordnet.wordnet import WordNet
 from data_prep.translate.translate import translate_lv_to_en_batch, load_model
+
 
 def get_tagged_lemmas(parsed_result, lemma_set_lower, primary_lemma):
   """Return dict mapping tag_num -> lemma for all loanwords in sentence."""
@@ -102,7 +104,13 @@ def get_best_sentence_per_lemma(
 
 
 def get_sentences_with_fallback(
-  lemmas, corpus, cqp_bin, cqp_dir, lemma_set_lower, do_score=True, limit=100000
+  lemmas,
+  corpus,
+  cqp_bin,
+  cqp_dir,
+  lemma_set_lower,
+  do_score=True,
+  limit=100000,
 ):
   """Query all lemmas at once with limit, then fallback for missing ones."""
   escaped = [re.escape(lemma) for lemma in lemmas]
@@ -132,7 +140,10 @@ def get_sentences_with_fallback(
         continue
 
       score = score_sentence(parsed) if do_score else 0
-      if lemma_lower not in best_by_lemma or score > best_by_lemma[lemma_lower][0]:
+      if (
+        lemma_lower not in best_by_lemma
+        or score > best_by_lemma[lemma_lower][0]
+      ):
         best_by_lemma[lemma_lower] = (score, parsed)
 
   found_count = len(best_by_lemma)
@@ -328,8 +339,8 @@ def print_results_summary(stats):
   print("RESULTS SUMMARY")
   print("=" * 60)
   print(f"Total lemmas processed: {total}")
-  print(f"  Found in corpus:      {found} ({100*found/total:.1f}%)")
-  print(f"  Not found:            {not_found} ({100*not_found/total:.1f}%)")
+  print(f"  Found in corpus:    {found} ({100*found/total:.1f}%)")
+  print(f"  Not found:      {not_found} ({100*not_found/total:.1f}%)")
 
   if stats["by_donor"]:
     print("\nBy donor language:")
@@ -567,7 +578,19 @@ def main():
   parser.add_argument("--corpus", default=DEFAULT_CORPUS)
   parser.add_argument("--cqp-bin", default=DEFAULT_CQP_BIN)
   parser.add_argument("--cqp-dir", default=DEFAULT_CQP_DIR)
+  parser.add_argument(
+    "--seed", type=int, default=42, help="Random seed for sampling (default: 42)"
+  )
+  parser.add_argument(
+    "--sample",
+    type=int,
+    default=None,
+    help="Sample N random found entries for validation",
+  )
   args = parser.parse_args()
+
+  # Set random seed
+  random.seed(args.seed)
 
   if not os.path.exists(args.wordnet_xml):
     print(f"Error: WordNet file {args.wordnet_xml} not found.", file=sys.stderr)
@@ -614,34 +637,64 @@ def main():
   }
 
   lemma_to_donor_word = {
-    row.get("recepient_word", "").strip().lower(): row.get("donor_word", "").strip()
+    row.get("recepient_word", "").strip().lower(): row.get(
+      "donor_word", ""
+    ).strip()
     for row in input_rows
     if row.get("recepient_word", "").strip()
   }
 
   print(f"Processing {len(input_rows)} entries (strategy: {args.strategy})...")
 
-  found_rows, not_found_rows, found_sentences, not_found_sentences, stats = (
-    process_entries(
-      input_rows,
-      args,
-      lemma_set_lower,
-      lemma_to_lang_info,
-      lemma_to_donor_lang,
-      lemma_to_donor_word,
-      wn,
-    )
+  (
+    found_rows,
+    not_found_rows,
+    found_sentences,
+    not_found_sentences,
+    stats,
+  ) = process_entries(
+    input_rows,
+    args,
+    lemma_set_lower,
+    lemma_to_lang_info,
+    lemma_to_donor_lang,
+    lemma_to_donor_word,
+    wn,
   )
+
+  print_results_summary(stats)
+
+  # Sampling logic
+  if args.sample is not None and args.sample > 0:
+    if len(found_rows) > args.sample:
+      print(
+        f"Sampling {args.sample} random entries from {len(found_rows)} found..."
+      )
+      # Zip to ensure we keep the sentence text aligned with the row metadata
+      combined = list(zip(found_rows, found_sentences))
+      sampled_combined = random.sample(combined, args.sample)
+      found_rows, found_sentences = zip(*sampled_combined)
+      found_rows = list(found_rows)
+      found_sentences = list(found_sentences)
+
+      # Clear not_found lists so the output only contains the valid sample
+      print("Note: Output will contain ONLY the sampled found rows.")
+      not_found_rows = []
+      not_found_sentences = []
+    else:
+      print(
+        f"Requested sample size ({args.sample}) is larger than found entries ({len(found_rows)}). Outputting all found."
+      )
 
   rows_to_write = found_rows + not_found_rows
   sentences_to_translate = found_sentences + not_found_sentences
-  print_results_summary(stats)
 
   column_widths_cm = [6.4, 6.4, 6.4, 1.8, 3.0, 3.0, 6.4, 10.0]
 
   if args.translate:
     print(f"Translating {len(sentences_to_translate)} sentences...")
     translations = []
+    # Translate in batches
     for i in tqdm(
       range(0, len(sentences_to_translate), args.batch_size),
       desc="Translating",
@@ -656,8 +709,8 @@ def main():
   write_output(args, rows_to_write, column_widths_cm)
 
   print(f"ConLoan annotation file generated: {args.output}")
-  print(f"  - {len(found_rows)} matched lemmas")
-  print(f"  - {len(not_found_rows)} not found (placeholders appended)")
+  print(f"  - {len(found_rows)} matched lemmas included in output")
+  print(f"  - {len(not_found_rows)} not found placeholders included in output")
 
 
 if __name__ == "__main__":
